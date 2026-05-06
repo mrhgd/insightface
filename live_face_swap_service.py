@@ -44,9 +44,9 @@ app.add_middleware(
 # --- model loading (once at startup) -----------------------------------------
 print("[live-swap] loading InsightFace buffalo_l detector...")
 analyzer = FaceAnalysis(name="buffalo_l")
-# 320x320 detector cuts detection time roughly in half versus 640x640.
-# Plenty of resolution for webcam-sized frames.
-analyzer.prepare(ctx_id=0, det_size=(320, 320))
+# 512x512 is a good quality/speed tradeoff for webcam frames —
+# detects smaller faces & landmarks more accurately than 320 without doubling time.
+analyzer.prepare(ctx_id=0, det_size=(512, 512))
 
 # inswapper_128 — the library's auto-downloader looks for a .zip that no longer
 # exists. Fetch the raw .onnx directly into the expected cache location.
@@ -73,7 +73,7 @@ def _decode(data: bytes) -> np.ndarray:
     return img
 
 
-def _encode_jpeg(img: np.ndarray, quality: int = 80) -> bytes:
+def _encode_jpeg(img: np.ndarray, quality: int = 92) -> bytes:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise HTTPException(500, "JPEG encode failed")
