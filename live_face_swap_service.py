@@ -98,8 +98,59 @@ async def set_source(image: UploadFile = File(...)):
     return {"ok": True, "bbox": [int(v) for v in source_face.bbox.tolist()]}
 
 
+def _expand_swap_chin(orig: np.ndarray, swapped: np.ndarray, face) -> np.ndarray:
+    """Extend inswapper's center-face coverage down to hide beard/chin hair.
+
+    inswapper_128 only regenerates the central face oval, so beards on the
+    chin/jaw/jawline stay visible. Approach:
+      1. Build a lower-face ellipse mask (nose-to-chin region).
+      2. Intersect it with the area the swapper did NOT modify (the beard zone).
+      3. Inpaint that zone using surrounding swapped skin tones.
+    """
+    try:
+        bbox = face.bbox.astype(int)
+        x1, y1, x2, y2 = bbox
+        kps = face.kps
+        nose = kps[2]
+
+        # 1. Lower-face ellipse mask (from nose tip down to chin)
+        cx = int((x1 + x2) / 2)
+        cy = int((nose[1] + y2) / 2)
+        w = int((x2 - x1) * 0.42)
+        h = int((y2 - nose[1]) * 0.85)
+        if w < 5 or h < 5:
+            return swapped
+        H, W = orig.shape[:2]
+        chin_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.ellipse(chin_mask, (cx, cy), (w, h), 0, 0, 360, 255, -1)
+
+        # 2. "Untouched" mask = where swapped == orig (i.e. the beard / jaw area)
+        diff = cv2.absdiff(swapped, orig).max(axis=2)
+        untouched = (diff < 6).astype(np.uint8) * 255
+
+        # Beard zone = chin region AND untouched by swapper
+        inpaint_mask = cv2.bitwise_and(chin_mask, untouched)
+        # Small dilation to make sure edges of beard are covered
+        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((5, 5), np.uint8))
+
+        if cv2.countNonZero(inpaint_mask) < 50:
+            return swapped  # no meaningful beard to cover
+
+        # 3. Inpaint: uses surrounding swapped-skin pixels to fill the beard zone
+        filled = cv2.inpaint(swapped, inpaint_mask, 5, cv2.INPAINT_TELEA)
+
+        # Feather the inpaint mask for a soft blend back into the swapped image
+        feather = cv2.GaussianBlur(inpaint_mask, (31, 31), 0).astype(np.float32) / 255.0
+        feather = feather[:, :, None]
+        result = filled.astype(np.float32) * feather + swapped.astype(np.float32) * (1 - feather)
+        return np.clip(result, 0, 255).astype(np.uint8)
+    except Exception as e:
+        print(f"[live-swap] chin-expand failed: {e}")
+        return swapped
+
+
 @app.post("/swap")
-async def swap(image: UploadFile = File(...)):
+async def swap(image: UploadFile = File(...), cover_beard: int = 0):
     if source_face is None:
         raise HTTPException(400, "Source face not set. POST /set_source first.")
     t0 = time.time()
@@ -113,7 +164,11 @@ async def swap(image: UploadFile = File(...)):
 
     res = img.copy()
     for face in faces:
-        res = swapper.get(res, face, source_face, paste_back=True)
+        swapped = swapper.get(res, face, source_face, paste_back=True)
+        if cover_beard:
+            res = _expand_swap_chin(res, swapped, face)
+        else:
+            res = swapped
 
     out = _encode_jpeg(res)
     return Response(content=out, media_type="image/jpeg",
