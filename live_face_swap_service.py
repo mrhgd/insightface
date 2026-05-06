@@ -99,50 +99,91 @@ async def set_source(image: UploadFile = File(...)):
 
 
 def _expand_swap_chin(orig: np.ndarray, swapped: np.ndarray, face) -> np.ndarray:
-    """Extend inswapper's center-face coverage down to hide beard/chin hair.
+    """Aggressively cover beard/chin by painting the lower face with clean
+    skin tone sampled from the swapped cheeks.
 
-    inswapper_128 only regenerates the central face oval, so beards on the
-    chin/jaw/jawline stay visible. Approach:
-      1. Build a lower-face ellipse mask (nose-to-chin region).
-      2. Intersect it with the area the swapper did NOT modify (the beard zone).
-      3. Inpaint that zone using surrounding swapped skin tones.
+    Inswapper only regenerates the central face oval, leaving the beard intact
+    on the chin/jaw. A plain inpaint averages nearby pixels — which still
+    contain beard hair — so the result looks "softly blurred beard". Instead
+    we grab the clean skin color from the upper-cheek area (which inswapper
+    DID paint) and paint the beard region with that tone, then re-apply
+    shading from the swapped image to keep natural lighting.
     """
     try:
         bbox = face.bbox.astype(int)
         x1, y1, x2, y2 = bbox
         kps = face.kps
-        nose = kps[2]
+        l_eye, r_eye, nose, l_mouth, r_mouth = kps
 
-        # 1. Lower-face ellipse mask (from nose tip down to chin)
+        H, W = orig.shape[:2]
+
+        # 1. Lower-face mask: large ellipse from just above the mouth to past
+        # the chin. Pad wider than the bbox so we catch sideburn area.
+        mouth_y = int((l_mouth[1] + r_mouth[1]) / 2)
         cx = int((x1 + x2) / 2)
-        cy = int((nose[1] + y2) / 2)
-        w = int((x2 - x1) * 0.42)
-        h = int((y2 - nose[1]) * 0.85)
+        # Start the ellipse at the mouth line, extend down past bottom of bbox
+        cy = int((mouth_y + y2) / 2)
+        w = int((x2 - x1) * 0.55)
+        h = int((y2 - mouth_y) * 1.15)
         if w < 5 or h < 5:
             return swapped
-        H, W = orig.shape[:2]
         chin_mask = np.zeros((H, W), dtype=np.uint8)
         cv2.ellipse(chin_mask, (cx, cy), (w, h), 0, 0, 360, 255, -1)
 
-        # 2. "Untouched" mask = where swapped == orig (i.e. the beard / jaw area)
+        # 2. Find pixels untouched by the swapper (beard zone).
         diff = cv2.absdiff(swapped, orig).max(axis=2)
-        untouched = (diff < 6).astype(np.uint8) * 255
+        untouched = (diff < 10).astype(np.uint8) * 255
+        beard_mask = cv2.bitwise_and(chin_mask, untouched)
 
-        # Beard zone = chin region AND untouched by swapper
-        inpaint_mask = cv2.bitwise_and(chin_mask, untouched)
-        # Small dilation to make sure edges of beard are covered
-        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((5, 5), np.uint8))
+        # Also aggressively include any dark pixels inside the chin ellipse
+        # (dark = likely beard/stubble), even if the swapper kinda-touched them.
+        gray = cv2.cvtColor(swapped, cv2.COLOR_BGR2GRAY)
+        dark = ((gray < 90).astype(np.uint8) * 255)
+        dark_in_chin = cv2.bitwise_and(chin_mask, dark)
+        beard_mask = cv2.bitwise_or(beard_mask, dark_in_chin)
 
-        if cv2.countNonZero(inpaint_mask) < 50:
-            return swapped  # no meaningful beard to cover
+        # Dilate generously to cover beard edges that fade into skin
+        beard_mask = cv2.dilate(beard_mask, np.ones((9, 9), np.uint8))
 
-        # 3. Inpaint: uses surrounding swapped-skin pixels to fill the beard zone
-        filled = cv2.inpaint(swapped, inpaint_mask, 5, cv2.INPAINT_TELEA)
+        if cv2.countNonZero(beard_mask) < 100:
+            return swapped
 
-        # Feather the inpaint mask for a soft blend back into the swapped image
-        feather = cv2.GaussianBlur(inpaint_mask, (31, 31), 0).astype(np.float32) / 255.0
+        # 3. Sample CLEAN skin tone from upper-cheek patches (areas inswapper
+        # painted fresh). These sit just under the eyes, above the mouth.
+        def sample_patch(pt, half=6):
+            px, py = int(pt[0]), int(pt[1])
+            x0 = max(0, px - half); x1_ = min(W, px + half)
+            y0 = max(0, py - half); y1_ = min(H, py + half)
+            patch = swapped[y0:y1_, x0:x1_]
+            if patch.size == 0:
+                return None
+            # Use median for robustness against outliers
+            return np.median(patch.reshape(-1, 3), axis=0)
+
+        # Cheek sample points: below each eye, offset toward the nose
+        left_cheek = sample_patch(((l_eye[0] + nose[0]) / 2, (l_eye[1] + nose[1]) / 2 + 6))
+        right_cheek = sample_patch(((r_eye[0] + nose[0]) / 2, (r_eye[1] + nose[1]) / 2 + 6))
+        samples = [s for s in (left_cheek, right_cheek) if s is not None]
+        if not samples:
+            return swapped
+        skin_color = np.median(np.stack(samples, axis=0), axis=0)  # BGR
+
+        # 4. Paint the beard zone with that skin color, then restore shading.
+        # Build a solid-color layer of the skin tone.
+        skin_layer = np.full_like(swapped, skin_color.astype(np.uint8))
+
+        # Preserve the swapped image's luminance (shading) so it's not flat.
+        # Blend: skin_layer provides chroma, swapped provides structure.
+        swapped_blur = cv2.GaussianBlur(swapped, (15, 15), 0)
+        swapped_gray = cv2.cvtColor(swapped_blur, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        # Normalize luminance into a 0.85..1.15 multiplier for gentle shading
+        lum = (swapped_gray / swapped_gray.mean()).clip(0.85, 1.15)[:, :, None]
+        shaded = (skin_layer.astype(np.float32) * lum).clip(0, 255).astype(np.uint8)
+
+        # 5. Feather the mask and composite shaded skin over swapped result.
+        feather = cv2.GaussianBlur(beard_mask, (41, 41), 0).astype(np.float32) / 255.0
         feather = feather[:, :, None]
-        result = filled.astype(np.float32) * feather + swapped.astype(np.float32) * (1 - feather)
+        result = shaded.astype(np.float32) * feather + swapped.astype(np.float32) * (1 - feather)
         return np.clip(result, 0, 255).astype(np.uint8)
     except Exception as e:
         print(f"[live-swap] chin-expand failed: {e}")
