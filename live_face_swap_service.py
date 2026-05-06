@@ -44,9 +44,9 @@ app.add_middleware(
 # --- model loading (once at startup) -----------------------------------------
 print("[live-swap] loading InsightFace buffalo_l detector...")
 analyzer = FaceAnalysis(name="buffalo_l")
-# 512x512 is a good quality/speed tradeoff for webcam frames —
-# detects smaller faces & landmarks more accurately than 320 without doubling time.
-analyzer.prepare(ctx_id=0, det_size=(512, 512))
+# 320x320 detector cuts detection time roughly in half versus 640x640.
+# Plenty of resolution for webcam-sized frames.
+analyzer.prepare(ctx_id=0, det_size=(320, 320))
 
 # inswapper_128 — the library's auto-downloader looks for a .zip that no longer
 # exists. Fetch the raw .onnx directly into the expected cache location.
@@ -64,13 +64,6 @@ swapper = insightface.model_zoo.get_model(_INSWAP_PATH)
 
 source_face = None  # cached after /set_source
 
-# Detection caching: detection (~30-60ms) is the most expensive step. Re-run it
-# every Nth frame and reuse the bboxes/embeddings in between. Faces don't move
-# dramatically between adjacent frames at 10+ fps, so this is nearly invisible.
-_DET_EVERY = 3
-_frame_count = 0
-_cached_faces: list = []
-
 
 def _decode(data: bytes) -> np.ndarray:
     arr = np.frombuffer(data, np.uint8)
@@ -80,7 +73,7 @@ def _decode(data: bytes) -> np.ndarray:
     return img
 
 
-def _encode_jpeg(img: np.ndarray, quality: int = 92) -> bytes:
+def _encode_jpeg(img: np.ndarray, quality: int = 80) -> bytes:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise HTTPException(500, "JPEG encode failed")
@@ -107,26 +100,16 @@ async def set_source(image: UploadFile = File(...)):
 
 @app.post("/swap")
 async def swap(image: UploadFile = File(...)):
-    global _frame_count, _cached_faces
     if source_face is None:
         raise HTTPException(400, "Source face not set. POST /set_source first.")
     t0 = time.time()
     img = _decode(await image.read())
 
-    # Run heavy detection only every N frames; reuse cached faces in between.
-    do_detect = (_frame_count % _DET_EVERY == 0) or not _cached_faces
-    _frame_count += 1
-    if do_detect:
-        faces = analyzer.get(img)
-        if faces:
-            _cached_faces = faces
-        else:
-            # Lost the face — invalidate cache and return original this frame.
-            _cached_faces = []
-            return Response(content=_encode_jpeg(img), media_type="image/jpeg",
-                            headers={"X-Latency-Ms": f"{int((time.time() - t0) * 1000)}", "X-Faces": "0"})
-    else:
-        faces = _cached_faces
+    faces = analyzer.get(img)
+    if not faces:
+        # No face in this frame — return original so the stream stays smooth.
+        return Response(content=_encode_jpeg(img), media_type="image/jpeg",
+                        headers={"X-Latency-Ms": f"{int((time.time() - t0) * 1000)}", "X-Faces": "0"})
 
     res = img.copy()
     for face in faces:
@@ -134,11 +117,7 @@ async def swap(image: UploadFile = File(...)):
 
     out = _encode_jpeg(res)
     return Response(content=out, media_type="image/jpeg",
-                    headers={
-                        "X-Latency-Ms": f"{int((time.time() - t0) * 1000)}",
-                        "X-Faces": str(len(faces)),
-                        "X-Detected": "1" if do_detect else "0",
-                    })
+                    headers={"X-Latency-Ms": f"{int((time.time() - t0) * 1000)}", "X-Faces": str(len(faces))})
 
 
 if __name__ == "__main__":
@@ -147,5 +126,4 @@ if __name__ == "__main__":
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8189)
     args = p.parse_args()
-    # log_level=warning + access_log=False trims a few ms per request
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", access_log=False)
+    uvicorn.run(app, host=args.host, port=args.port)
