@@ -64,6 +64,13 @@ swapper = insightface.model_zoo.get_model(_INSWAP_PATH)
 
 source_face = None  # cached after /set_source
 
+# Detection caching: detection (~30-60ms) is the most expensive step. Re-run it
+# every Nth frame and reuse the bboxes/embeddings in between. Faces don't move
+# dramatically between adjacent frames at 10+ fps, so this is nearly invisible.
+_DET_EVERY = 3
+_frame_count = 0
+_cached_faces: list = []
+
 
 def _decode(data: bytes) -> np.ndarray:
     arr = np.frombuffer(data, np.uint8)
@@ -100,16 +107,26 @@ async def set_source(image: UploadFile = File(...)):
 
 @app.post("/swap")
 async def swap(image: UploadFile = File(...)):
+    global _frame_count, _cached_faces
     if source_face is None:
         raise HTTPException(400, "Source face not set. POST /set_source first.")
     t0 = time.time()
     img = _decode(await image.read())
 
-    faces = analyzer.get(img)
-    if not faces:
-        # No face in this frame — return original so the stream stays smooth.
-        return Response(content=_encode_jpeg(img), media_type="image/jpeg",
-                        headers={"X-Latency-Ms": f"{int((time.time() - t0) * 1000)}", "X-Faces": "0"})
+    # Run heavy detection only every N frames; reuse cached faces in between.
+    do_detect = (_frame_count % _DET_EVERY == 0) or not _cached_faces
+    _frame_count += 1
+    if do_detect:
+        faces = analyzer.get(img)
+        if faces:
+            _cached_faces = faces
+        else:
+            # Lost the face — invalidate cache and return original this frame.
+            _cached_faces = []
+            return Response(content=_encode_jpeg(img), media_type="image/jpeg",
+                            headers={"X-Latency-Ms": f"{int((time.time() - t0) * 1000)}", "X-Faces": "0"})
+    else:
+        faces = _cached_faces
 
     res = img.copy()
     for face in faces:
@@ -117,7 +134,11 @@ async def swap(image: UploadFile = File(...)):
 
     out = _encode_jpeg(res)
     return Response(content=out, media_type="image/jpeg",
-                    headers={"X-Latency-Ms": f"{int((time.time() - t0) * 1000)}", "X-Faces": str(len(faces))})
+                    headers={
+                        "X-Latency-Ms": f"{int((time.time() - t0) * 1000)}",
+                        "X-Faces": str(len(faces)),
+                        "X-Detected": "1" if do_detect else "0",
+                    })
 
 
 if __name__ == "__main__":
@@ -126,4 +147,5 @@ if __name__ == "__main__":
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8189)
     args = p.parse_args()
-    uvicorn.run(app, host=args.host, port=args.port)
+    # log_level=warning + access_log=False trims a few ms per request
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", access_log=False)
