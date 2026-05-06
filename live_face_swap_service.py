@@ -99,92 +99,71 @@ async def set_source(image: UploadFile = File(...)):
 
 
 def _expand_swap_chin(orig: np.ndarray, swapped: np.ndarray, face) -> np.ndarray:
-    """Aggressively cover beard/chin by painting the lower face with clean
-    skin tone sampled from the swapped cheeks.
+    """Fast beard-cover: paint chin ellipse with cheek-skin color, tiny feather.
 
-    Inswapper only regenerates the central face oval, leaving the beard intact
-    on the chin/jaw. A plain inpaint averages nearby pixels — which still
-    contain beard hair — so the result looks "softly blurred beard". Instead
-    we grab the clean skin color from the upper-cheek area (which inswapper
-    DID paint) and paint the beard region with that tone, then re-apply
-    shading from the swapped image to keep natural lighting.
+    Operates only on a small crop around the face for speed. Flat skin fill
+    (no shading preservation) keeps things crisp rather than blurred.
     """
     try:
         bbox = face.bbox.astype(int)
         x1, y1, x2, y2 = bbox
         kps = face.kps
-        l_eye, r_eye, nose, l_mouth, r_mouth = kps
+        l_eye, r_eye, nose, _l_mouth, _r_mouth = kps
 
-        H, W = orig.shape[:2]
+        H, W = swapped.shape[:2]
 
-        # 1. Lower-face mask: large ellipse from just above the mouth to past
-        # the chin. Pad wider than the bbox so we catch sideburn area.
-        mouth_y = int((l_mouth[1] + r_mouth[1]) / 2)
-        cx = int((x1 + x2) / 2)
-        # Start the ellipse at the mouth line, extend down past bottom of bbox
-        cy = int((mouth_y + y2) / 2)
-        w = int((x2 - x1) * 0.55)
-        h = int((y2 - mouth_y) * 1.15)
-        if w < 5 or h < 5:
+        # Work on a crop around the face bbox (2x faster than full frame)
+        pad_x = int((x2 - x1) * 0.2)
+        pad_y = int((y2 - y1) * 0.3)
+        cx0 = max(0, x1 - pad_x); cy0 = max(0, y1 - pad_y)
+        cx1 = min(W, x2 + pad_x); cy1 = min(H, y2 + pad_y)
+        if cx1 - cx0 < 20 or cy1 - cy0 < 20:
             return swapped
-        chin_mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.ellipse(chin_mask, (cx, cy), (w, h), 0, 0, 360, 255, -1)
+        crop = swapped[cy0:cy1, cx0:cx1].copy()
+        ch, cw = crop.shape[:2]
 
-        # 2. Find pixels untouched by the swapper (beard zone).
-        diff = cv2.absdiff(swapped, orig).max(axis=2)
-        untouched = (diff < 10).astype(np.uint8) * 255
-        beard_mask = cv2.bitwise_and(chin_mask, untouched)
+        # Coordinates relative to crop
+        def rel(pt):
+            return int(pt[0] - cx0), int(pt[1] - cy0)
+        l_eye_c = rel(l_eye); r_eye_c = rel(r_eye); nose_c = rel(nose)
 
-        # Also aggressively include any dark pixels inside the chin ellipse
-        # (dark = likely beard/stubble), even if the swapper kinda-touched them.
-        gray = cv2.cvtColor(swapped, cv2.COLOR_BGR2GRAY)
-        dark = ((gray < 90).astype(np.uint8) * 255)
-        dark_in_chin = cv2.bitwise_and(chin_mask, dark)
-        beard_mask = cv2.bitwise_or(beard_mask, dark_in_chin)
-
-        # Dilate generously to cover beard edges that fade into skin
-        beard_mask = cv2.dilate(beard_mask, np.ones((9, 9), np.uint8))
-
-        if cv2.countNonZero(beard_mask) < 100:
-            return swapped
-
-        # 3. Sample CLEAN skin tone from upper-cheek patches (areas inswapper
-        # painted fresh). These sit just under the eyes, above the mouth.
-        def sample_patch(pt, half=6):
-            px, py = int(pt[0]), int(pt[1])
-            x0 = max(0, px - half); x1_ = min(W, px + half)
-            y0 = max(0, py - half); y1_ = min(H, py + half)
-            patch = swapped[y0:y1_, x0:x1_]
-            if patch.size == 0:
-                return None
-            # Use median for robustness against outliers
-            return np.median(patch.reshape(-1, 3), axis=0)
-
-        # Cheek sample points: below each eye, offset toward the nose
-        left_cheek = sample_patch(((l_eye[0] + nose[0]) / 2, (l_eye[1] + nose[1]) / 2 + 6))
-        right_cheek = sample_patch(((r_eye[0] + nose[0]) / 2, (r_eye[1] + nose[1]) / 2 + 6))
-        samples = [s for s in (left_cheek, right_cheek) if s is not None]
+        # 1. Sample clean skin from both cheeks (one patch per side, 6x6)
+        def sample(pt, half=5):
+            px, py = pt
+            x0 = max(0, px - half); xx = min(cw, px + half)
+            y0 = max(0, py - half); yy = min(ch, py + half)
+            p = crop[y0:yy, x0:xx]
+            if p.size == 0: return None
+            return np.median(p.reshape(-1, 3), axis=0)
+        samples = [s for s in (
+            sample(((l_eye_c[0] + nose_c[0]) // 2, (l_eye_c[1] + nose_c[1]) // 2 + 4)),
+            sample(((r_eye_c[0] + nose_c[0]) // 2, (r_eye_c[1] + nose_c[1]) // 2 + 4)),
+        ) if s is not None]
         if not samples:
             return swapped
-        skin_color = np.median(np.stack(samples, axis=0), axis=0)  # BGR
+        skin = np.median(np.stack(samples, axis=0), axis=0).astype(np.uint8)
 
-        # 4. Paint the beard zone with that skin color, then restore shading.
-        # Build a solid-color layer of the skin tone.
-        skin_layer = np.full_like(swapped, skin_color.astype(np.uint8))
+        # 2. Chin ellipse mask (just below the nose down past the chin)
+        e_cx = cw // 2
+        e_cy = int((nose_c[1] + ch) * 0.55)
+        e_w = int(cw * 0.32)
+        e_h = int((ch - nose_c[1]) * 0.55)
+        if e_w < 5 or e_h < 5:
+            return swapped
+        mask = np.zeros((ch, cw), dtype=np.uint8)
+        cv2.ellipse(mask, (e_cx, e_cy), (e_w, e_h), 0, 0, 360, 255, -1)
 
-        # Preserve the swapped image's luminance (shading) so it's not flat.
-        # Blend: skin_layer provides chroma, swapped provides structure.
-        swapped_blur = cv2.GaussianBlur(swapped, (15, 15), 0)
-        swapped_gray = cv2.cvtColor(swapped_blur, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        # Normalize luminance into a 0.85..1.15 multiplier for gentle shading
-        lum = (swapped_gray / swapped_gray.mean()).clip(0.85, 1.15)[:, :, None]
-        shaded = (skin_layer.astype(np.float32) * lum).clip(0, 255).astype(np.uint8)
+        # Tight feather (15x15 is much faster than 41x41 and keeps edges crisp)
+        mask_f = cv2.GaussianBlur(mask, (15, 15), 0).astype(np.float32) / 255.0
+        mask_f = mask_f[:, :, None]
 
-        # 5. Feather the mask and composite shaded skin over swapped result.
-        feather = cv2.GaussianBlur(beard_mask, (41, 41), 0).astype(np.float32) / 255.0
-        feather = feather[:, :, None]
-        result = shaded.astype(np.float32) * feather + swapped.astype(np.float32) * (1 - feather)
-        return np.clip(result, 0, 255).astype(np.uint8)
+        # 3. Flat skin fill, no shading trick → no blur look
+        fill = np.full_like(crop, skin)
+        blended = (fill.astype(np.float32) * mask_f + crop.astype(np.float32) * (1 - mask_f)).astype(np.uint8)
+
+        out = swapped.copy()
+        out[cy0:cy1, cx0:cx1] = blended
+        return out
     except Exception as e:
         print(f"[live-swap] chin-expand failed: {e}")
         return swapped
