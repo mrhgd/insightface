@@ -44,7 +44,9 @@ app.add_middleware(
 # --- model loading (once at startup) -----------------------------------------
 print("[live-swap] loading InsightFace buffalo_l detector...")
 analyzer = FaceAnalysis(name="buffalo_l")
-analyzer.prepare(ctx_id=0, det_size=(640, 640))
+# 320x320 detector cuts detection time roughly in half versus 640x640.
+# Plenty of resolution for webcam-sized frames.
+analyzer.prepare(ctx_id=0, det_size=(320, 320))
 
 # inswapper_128 — the library's auto-downloader looks for a .zip that no longer
 # exists. Fetch the raw .onnx directly into the expected cache location.
