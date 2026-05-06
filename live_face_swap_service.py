@@ -73,7 +73,7 @@ def _decode(data: bytes) -> np.ndarray:
     return img
 
 
-def _encode_jpeg(img: np.ndarray, quality: int = 80) -> bytes:
+def _encode_jpeg(img: np.ndarray, quality: int = 90) -> bytes:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise HTTPException(500, "JPEG encode failed")
