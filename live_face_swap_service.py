@@ -19,7 +19,9 @@ This serves two endpoints:
 """
 import argparse
 import io
+import os
 import time
+import urllib.request
 from typing import Optional
 
 import cv2
@@ -44,8 +46,19 @@ print("[live-swap] loading InsightFace buffalo_l detector...")
 analyzer = FaceAnalysis(name="buffalo_l")
 analyzer.prepare(ctx_id=0, det_size=(640, 640))
 
+# inswapper_128 — the library's auto-downloader looks for a .zip that no longer
+# exists. Fetch the raw .onnx directly into the expected cache location.
+_INSWAP_DIR = os.path.expanduser("~/.insightface/models")
+_INSWAP_PATH = os.path.join(_INSWAP_DIR, "inswapper_128.onnx")
+_INSWAP_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx"
+os.makedirs(_INSWAP_DIR, exist_ok=True)
+if not os.path.exists(_INSWAP_PATH) or os.path.getsize(_INSWAP_PATH) < 100_000_000:
+    print(f"[live-swap] downloading inswapper_128.onnx (~554MB) → {_INSWAP_PATH}")
+    urllib.request.urlretrieve(_INSWAP_URL, _INSWAP_PATH)
+    print("[live-swap] download complete")
+
 print("[live-swap] loading inswapper_128.onnx ...")
-swapper = insightface.model_zoo.get_model("inswapper_128.onnx", download=True, download_zip=True)
+swapper = insightface.model_zoo.get_model(_INSWAP_PATH)
 
 source_face = None  # cached after /set_source
 
