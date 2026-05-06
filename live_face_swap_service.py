@@ -4,7 +4,7 @@ Live Face Swap inference service for GenFlow.
 Run this on the same GPU pod that hosts ComfyUI, or any machine with a CUDA GPU.
 
 Setup:
-    pip install fastapi uvicorn[standard] insightface onnxruntime-gpu opencv-python-headless numpy pillow
+    pip install fastapi uvicorn[standard] python-multipart insightface onnxruntime-gpu opencv-python-headless numpy pillow
 
 Run:
     python live_face_swap_service.py --port 8189
